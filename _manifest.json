@@ -42,8 +42,7 @@
     "chat.get_stream_by_group_id",
     "message.get_by_id",
     "message.get_recent",
-    "message.build_readable",
-    "files.send"
+    "message.build_readable"
   ],
   "i18n": {
     "default_locale": "zh-CN",
