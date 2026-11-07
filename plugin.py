@@ -160,11 +160,15 @@ class PromptSectionConfig(PluginConfigBase):
         default=(
             "用户艾特了机器人，可能是要发布一个备忘/提醒任务，也可能只是聊天。\n"
             "请判断这是否是一条备忘任务（是否在请求机器人记下某事并在将来提醒）。\n"
+            "同时判断用户是否明确指定了提醒渠道：未指定=0，群聊=1，私聊=2。\n"
             "只返回一个 JSON 对象，不要输出其他文字：\n"
-            '{"is_task": true/false}'
+            '{"is_task": true/false, "channel": 0/1/2}'
         ),
-        description="艾特 bot 时的任务意图识别提示词（回复模型）",
-        json_schema_extra=_ui("意图识别提示词", "回复模型判断是否备忘任务"),
+        description=(
+            "艾特 bot 时的任务意图识别提示词（回复模型）。channel：0=未指定，1=群聊，2=私聊。"
+            "channel=2（私聊）时若用户没有已有的私聊流会失败，插件仍会走群聊@提醒。"
+        ),
+        json_schema_extra=_ui("意图识别提示词", "回复模型判断是否备忘任务及渠道；channel 2 私聊无流则回退群聊"),
     )
     reminder_style: str = Field(
         default=(
@@ -579,30 +583,42 @@ class PersonalAssistantPlugin(MaiBotPlugin):
             self.ctx.logger.warning("备忘 LLM 调用失败：%s", result.get("reasoning") or result.get("response") or "unknown")
         return result
 
-    async def _parse_intent(self, text: str, now: datetime) -> tuple[bool, str, float | None]:
+    async def _parse_intent(self, text: str, now: datetime) -> tuple[bool, str, float | None, str]:
         """艾特 bot 时识别是否备忘任务。
 
-        识别「是否为任务」用回复模型（replyer）；确认是任务后，
+        识别「是否为任务」用回复模型（replyer），并同时让模型返回渠道偏好
+        （channel：0=未指定，1=群聊，2=私聊）；确认是任务后，
         「分析任务（提取时间/内容）」用规划模型（planner）。
-        返回 (is_task, task_text, remind_ts|None)。
+        返回 (is_task, task_text, remind_ts|None, channel_pref)。
         """
-        if not await self._detect_is_task(text, now):
-            return False, "", None
+        is_task, channel_pref = await self._detect_is_task(text, now)
+        if not is_task:
+            return False, "", None, ""
         task_text, remind_ts = await self._extract_reminder_from_text(text, now)
-        return True, task_text, remind_ts
+        return True, task_text, remind_ts, channel_pref
 
-    async def _detect_is_task(self, text: str, now: datetime) -> bool:
-        """判断用户消息是否为备忘任务（回复模型 replyer）。"""
+    async def _detect_is_task(self, text: str, now: datetime) -> tuple[bool, str]:
+        """判断用户消息是否为备忘任务（回复模型 replyer）。返回 (is_task, channel_pref)。
+
+        渠道偏好优先取模型返回的 channel（0=auto，1=group，2=private）；
+        模型未给出（0/缺失）时用关键词规则 ``_detect_channel_pref`` 兜底。
+        """
         prompt = self.config.prompts.intent_parse_prompt or ""
         if not prompt:
-            prompt = '请判断以下消息是否为备忘任务，只返回 JSON：{"is_task": true/false}'
+            prompt = '请判断以下消息是否为备忘任务，只返回 JSON：{"is_task": true/false, "channel": 0/1/2}'
         full = f"{prompt}\n\n当前时间：{now:%Y-%m-%d %H:%M:%S}\n用户消息：{text}\n"
         result = await self._llm_generate(full, task_name="replyer")
         data = self._parse_llm_json(str(result.get("response") or ""))
         if isinstance(data, dict):
-            return bool(data.get("is_task"))
+            is_task = bool(data.get("is_task"))
+            ch = data.get("channel")
+            ch_map = {"0": "auto", "1": "group", "2": "private"}
+            ch_pref = ch_map.get(str(ch).strip(), "") if ch is not None else ""
+            if ch_pref in ("", "auto"):
+                ch_pref = self._detect_channel_pref(text)
+            return is_task, ch_pref
         # 兜底：含提醒关键词则视为任务
-        return any(w in text for w in _HINT_WORDS)
+        return any(w in text for w in _HINT_WORDS), self._detect_channel_pref(text)
 
     async def _extract_reminder_from_text(self, text: str, now: datetime) -> tuple[str, float | None]:
         """从任务文本提取任务内容与提醒时间（规划模型 planner）。返回 (task_text, remind_ts|None)。"""
@@ -622,6 +638,8 @@ class PersonalAssistantPlugin(MaiBotPlugin):
             return text, None
         task_text = str(data.get("task_text") or "").strip() or text
         remind_ts = self._parse_remind_at(data.get("remind_at"), now)
+        remind_str = datetime.fromtimestamp(remind_ts).strftime("%Y-%m-%d %H:%M:%S") if remind_ts else "无"
+        self.ctx.logger.info("备忘：规划模型提取 时间=%s 内容=%s", remind_str, task_text[:30])
         return task_text, remind_ts
 
     @staticmethod
@@ -787,6 +805,12 @@ class PersonalAssistantPlugin(MaiBotPlugin):
             task["media"] = await self._save_media_for_task(task["id"], media)
             self._tasks.append(task)
         await self._save_tasks()
+        self.ctx.logger.info(
+            "备忘：任务已创建 id=%s user=%s 时间=%s channel=%s 媒体=%d 文本=%s",
+            task["id"][:8], user_id,
+            datetime.fromtimestamp(remind_ts).strftime("%Y-%m-%d %H:%M:%S"),
+            channel_pref, len(task.get("media") or []), task_text[:30],
+        )
         return task, ""
 
     def _validate_channel_pref(self, pref: str) -> str:
@@ -1230,14 +1254,19 @@ class PersonalAssistantPlugin(MaiBotPlugin):
                 return None
 
         # 粗筛：无提示词则仍尝试 LLM（用户要求艾特即识别）
-        is_task, task_text, remind_ts = await self._parse_intent(text or "[无文本]", now)
+        is_task, task_text, remind_ts, llm_channel = await self._parse_intent(text or "[无文本]", now)
         if not is_task:
             self.ctx.logger.debug("艾特消息非备忘任务，忽略：user=%s", user_id)
             return None
+        # 渠道偏好：LLM 返回优先，关键词规则兜底
+        channel_pref = llm_channel or self._detect_channel_pref(task_text or text)
+        self.ctx.logger.info(
+            "备忘：识别为任务 user=%s remind_ts=%s channel=%s 文本=%s",
+            user_id, remind_ts, channel_pref, (task_text or text)[:40],
+        )
 
         # 收集媒体（艾特消息自带的图片/文件 + 被引用消息里的媒体）
         media = await self._collect_media_with_reply(message)
-        channel_pref = self._detect_channel_pref(task_text or text)
         # 若已识别出具体时间且无媒体，可直接创建（不用等窗口）；否则进收集窗口等补充
         if remind_ts is not None and not media:
             task, reject = await self._create_task(
@@ -1364,26 +1393,79 @@ class PersonalAssistantPlugin(MaiBotPlugin):
             self.ctx.logger.info("备忘提醒完成：task=%s", task_id[:8])
 
     async def _resolve_reminder_stream(self, channel_pref: str, user_id: str, group_id: str) -> tuple[dict[str, Any] | None, bool]:
-        """确定提醒目标流。返回 (stream_dict|None, 私聊不可用提示标志)。"""
-        # 尝试私聊
-        if channel_pref in ("auto", "private"):
+        """确定提醒目标流。返回 (stream_dict|None, 私聊不可用提示标志)。
+
+        渠道规则（稳定一致，不依赖私聊流是否恰好存在）：
+        - channel=private：尝试私聊（活跃私聊流）；无则转群聊@（带提示标志）。
+        - channel=group：群聊@。
+        - channel=auto：群聊任务默认群聊@；私聊任务默认私聊。
+        """
+
+        async def _private() -> dict[str, Any] | None:
             try:
                 stream = await self.ctx.chat.get_stream_by_user_id(user_id)
                 if stream and isinstance(stream, dict):
-                    return {"stream_id": str(stream.get("stream_id") or stream.get("session_id") or ""), "is_group": False}, False
+                    sid = str(stream.get("stream_id") or stream.get("session_id") or "")
+                    return {"stream_id": sid, "is_group": False}
             except Exception as exc:
-                self.ctx.logger.debug("查询私聊流失败：%s", exc)
-            if channel_pref == "private":
-                # 用户指定私聊但无好友：返回提示标志（上层会转群聊@并提示）
-                self.ctx.logger.info("备忘：用户指定私聊但无好友，user=%s", user_id)
-        # 群聊 @ 兜底
-        if group_id:
+                self.ctx.logger.warning("查询私聊流失败：%s", exc)
+            return None
+
+        async def _group() -> dict[str, Any] | None:
             try:
                 gstream = await self.ctx.chat.get_stream_by_group_id(group_id)
                 if gstream and isinstance(gstream, dict):
-                    return {"stream_id": str(gstream.get("stream_id") or gstream.get("session_id") or ""), "is_group": True}, (channel_pref == "private")
+                    gsid = str(gstream.get("stream_id") or gstream.get("session_id") or "")
+                    return {"stream_id": gsid, "is_group": True}
             except Exception as exc:
-                self.ctx.logger.debug("查询群流失败：%s", exc)
+                self.ctx.logger.warning("查询群流失败：%s", exc)
+            return None
+
+        # 明确要求私聊：尝试私聊；无好友则转群聊@（带提示标志）
+        if channel_pref == "private":
+            s = await _private()
+            if s:
+                self.ctx.logger.info(
+                    "备忘提醒目标=私聊：user=%s（明确要求私聊，检测到私聊流 %s）", user_id, s["stream_id"]
+                )
+                return s, False
+            self.ctx.logger.info("备忘：用户指定私聊但无好友，user=%s", user_id)
+            if group_id:
+                g = await _group()
+                if g:
+                    self.ctx.logger.info("备忘提醒目标=群聊@：group=%s（指定私聊无好友，转群聊）", group_id)
+                    return g, True
+            self.ctx.logger.warning("备忘提醒目标=无：私聊不可用且无群聊目标，user=%s", user_id)
+            return None, False
+
+        # 明确要求群聊
+        if channel_pref == "group" and group_id:
+            g = await _group()
+            if g:
+                self.ctx.logger.info("备忘提醒目标=群聊@：group=%s（明确要求群聊）", group_id)
+                return g, False
+
+        # auto：群聊任务默认群聊@；私聊任务默认私聊
+        if group_id:
+            g = await _group()
+            if g:
+                reason = "群聊任务默认群聊@（未指定渠道）" if channel_pref == "auto" else "明确要求群聊"
+                self.ctx.logger.info("备忘提醒目标=群聊@：group=%s channel=%s（%s）", group_id, channel_pref, reason)
+                return g, False
+            # 群聊流异常：私聊兜底
+            s = await _private()
+            if s:
+                self.ctx.logger.info("备忘提醒目标=私聊：user=%s（群聊流不可用，私聊兜底）", user_id)
+                return s, False
+            self.ctx.logger.warning("备忘提醒目标=无：群聊任务但群聊流不可用，user=%s group=%s", user_id, group_id)
+            return None, False
+
+        # 私聊任务：默认私聊
+        s = await _private()
+        if s:
+            self.ctx.logger.info("备忘提醒目标=私聊：user=%s（私聊任务默认私聊）", user_id)
+            return s, False
+        self.ctx.logger.info("备忘提醒：私聊任务但无私聊流，user=%s", user_id)
         return None, False
 
     async def _build_reminder_text(self, task: dict[str, Any]) -> str:
