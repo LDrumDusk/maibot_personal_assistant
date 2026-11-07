@@ -135,6 +135,13 @@ class ReminderSectionConfig(PluginConfigBase):
         description="调度循环轮询间隔（秒）",
         json_schema_extra=_ui("轮询间隔(秒)", "勿设过小"),
     )
+    cleanup_interval_sec: float = Field(
+        default=7200.0,
+        ge=0.0,
+        le=604800.0,
+        description="定时清理过期备忘任务的间隔（秒），0 表示不自动清理",
+        json_schema_extra=_ui("清理间隔(秒)", "默认 7200（2小时）；0=关闭自动清理"),
+    )
     max_tasks_per_user: int = Field(
         default=20,
         ge=1,
@@ -521,14 +528,35 @@ class PersonalAssistantPlugin(MaiBotPlugin):
 
     async def _scheduler_loop(self) -> None:
         interval = max(0.2, float(self.config.reminder.poll_interval_sec))
+        cleanup_interval = max(0.0, float(self.config.reminder.cleanup_interval_sec or 0))
+        last_cleanup = 0.0
         while True:
             try:
                 await self._tick()
+                # 定时清理过期任务（cleanup_interval_sec=0 关闭）
+                if cleanup_interval > 0 and (time.time() - last_cleanup) >= cleanup_interval:
+                    last_cleanup = time.time()
+                    await self._cleanup_expired_tasks()
             except asyncio.CancelledError:
                 break
             except Exception as exc:
                 self.ctx.logger.warning("备忘调度 tick 异常：%s", exc)
             await asyncio.sleep(interval)
+
+    async def _cleanup_expired_tasks(self) -> int:
+        """清理所有已到期的任务（含已提醒/失败/拒绝），释放媒体文件。返回清理数。"""
+        now = time.time()
+        async with self._tasks_lock:
+            expired = [t for t in self._tasks if float(t.get("remind_at") or 0) <= now]
+            if not expired:
+                return 0
+            victim_ids = {id(t) for t in expired}
+            for t in expired:
+                self._delete_task_media(t)
+            self._tasks = [t for t in self._tasks if id(t) not in victim_ids]
+        await self._save_tasks()
+        self.ctx.logger.info("备忘：定时清理过期任务 %d 条", len(expired))
+        return len(expired)
 
     async def _tick(self) -> None:
         if not self.config.plugin.enabled:
@@ -1577,6 +1605,11 @@ class PersonalAssistantPlugin(MaiBotPlugin):
             return False, "缺少任务内容", 1
         if raw_text.lower() in ("查", "列表", "list"):
             return await self.cmd_list(**kwargs)
+        if raw_text.lower() in ("管理", "全部", "所有"):
+            return await self.cmd_admin_all(**kwargs)
+        if raw_text.lower() in ("清理", "清理过期", "清理全部"):
+            scope = "all" if "全部" in raw_text else "expired"
+            return await self.cmd_admin_clean(_scope=scope, **kwargs)
         if raw_text.lower().startswith("删"):
             return await self.cmd_delete_text(raw_text[1:].strip(), **kwargs)
         if raw_text.lower() in ("开", "on", "启用"):
@@ -1680,6 +1713,69 @@ class PersonalAssistantPlugin(MaiBotPlugin):
             text = "没找到这条任务（或它已处理/不属于你）。"
         await self.ctx.send.text(text, stream_id)
         return True, text, 1 if removed else 2
+
+    @Command(
+        "memo_admin_all",
+        description="查看所有用户的备忘任务（仅超级管理员）",
+        pattern=r"^/?备忘管理\s*$",
+    )
+    async def cmd_admin_all(self, **kwargs: Any) -> tuple[bool, str, int]:
+        """管理员查看所有待办备忘：仅返回用户ID、创建时间、截止时间。"""
+        stream_id = str(kwargs.get("stream_id") or "")
+        message = kwargs.get("message") or {}
+        if not await self._is_command_authorized(message):
+            await self.ctx.send.text(_CMD_DENIED_MSG, stream_id)
+            return False, "无权限", 1
+        now_ts = time.time()
+        async with self._tasks_lock:
+            tasks = [t for t in self._tasks if t.get("status") == _STATUS_PENDING]
+            tasks.sort(key=lambda t: float(t.get("remind_at") or 0))
+        if not tasks:
+            text = "当前没有待办的备忘任务。"
+        else:
+            lines = [f"当前共有 {len(tasks)} 条待办备忘："]
+            for t in tasks:
+                created = datetime.fromtimestamp(float(t.get("created_at") or now_ts)).strftime("%m-%d %H:%M")
+                remind = datetime.fromtimestamp(float(t.get("remind_at") or now_ts)).strftime("%m-%d %H:%M")
+                lines.append(f"· user={t.get('user_id')} 创建={created} 截止={remind}（{t['id'][:8]}）")
+            text = "\n".join(lines)
+        await self.ctx.send.text(text, stream_id)
+        return True, text, 1
+
+    @Command(
+        "memo_admin_clean",
+        description="清理过期或全部备忘任务（仅超级管理员）",
+        pattern=r"^/?备忘清理\s*(?P<scope>expired|all|过期|全部)?\s*$",
+    )
+    async def cmd_admin_clean(self, _scope: str = "", **kwargs: Any) -> tuple[bool, str, int]:
+        """管理员清理过期任务（remind_at 已到）或全部任务。_scope: expired/all。"""
+        stream_id = str(kwargs.get("stream_id") or "")
+        message = kwargs.get("message") or {}
+        if not await self._is_command_authorized(message):
+            await self.ctx.send.text(_CMD_DENIED_MSG, stream_id)
+            return False, "无权限", 1
+        matched = kwargs.get("matched_groups") or {}
+        scope = str(_scope or matched.get("scope") or "expired").strip().lower()
+        clean_all = scope in ("all", "全部")
+        now = time.time()
+        async with self._tasks_lock:
+            if clean_all:
+                victims = list(self._tasks)
+            else:
+                victims = [t for t in self._tasks if float(t.get("remind_at") or 0) <= now]
+            if not victims:
+                await self.ctx.send.text("没有需要清理的备忘任务。", stream_id)
+                return True, "没有需要清理", 2
+            victim_ids = {id(t) for t in victims}
+            for t in victims:
+                self._delete_task_media(t)
+            self._tasks = [t for t in self._tasks if id(t) not in victim_ids]
+        await self._save_tasks()
+        label = "全部" if clean_all else "过期"
+        text = f"已清理 {len(victims)} 条{label}备忘任务。"
+        self.ctx.logger.info("备忘：管理员清理%s任务 %d 条", label, len(victims))
+        await self.ctx.send.text(text, stream_id)
+        return True, text, 1
 
     # ==================== 配置写入 ====================
 
